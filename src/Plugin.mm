@@ -1,4 +1,5 @@
 #import <UIKit/UIKit.h>
+#import <UIKit/UIGestureRecognizerSubclass.h>
 #import <CommonCrypto/CommonDigest.h>
 #import <Metal/Metal.h>
 #import <MetalKit/MetalKit.h>
@@ -14,8 +15,10 @@
 #include <mach-o/loader.h>
 #include <cstring>
 #include <cstdio>
+#include <cstdlib>
 #include <memory>
 #include <vector>
+#include <algorithm>
 #include "imgui_impl_metal.h"
 #include <cfloat>
 #include <cmath>
@@ -131,87 +134,12 @@ static bool VTCheckBuild(){
 @class VTMenuController;
 @class VTPassthroughView;
 
-@class VTMenuController;
-
-@interface VTJumpGestureRecognizer : UIGestureRecognizer <UIGestureRecognizerDelegate>
-@property(nonatomic, weak) VTMenuController* menuController;
-@end
-
-@implementation VTJumpGestureRecognizer {
-    NSMutableSet<UITouch*>* _jumpTouches;
-}
--(instancetype)init{
-    if(self = [super initWithTarget:nil action:nil]){
-        self.cancelsTouchesInView = NO;
-        self.delaysTouchesBegan = NO;
-        self.delaysTouchesEnded = NO;
-        self.delegate = self;
-        _jumpTouches = [NSMutableSet setWithCapacity:8];
-    }
-    return self;
-}
--(BOOL)canPreventGestureRecognizer:(UIGestureRecognizer *)preventedGestureRecognizer { return NO; }
--(BOOL)canBePreventedByGestureRecognizer:(UIGestureRecognizer *)preventingGestureRecognizer { return NO; }
--(BOOL)gestureRecognizer:(UIGestureRecognizer *)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer *)otherGestureRecognizer { return YES; }
-
--(BOOL)isJumpTouch:(UITouch*)touch inView:(UIView*)view {
-    if(!view) return NO;
-    CGPoint p = [touch locationInView:view];
-    CGSize sz = view.bounds.size;
-    if(sz.width <= 0 || sz.height <= 0) return NO;
-    if(sz.width >= sz.height) { // Landscape: jump button is bottom-right
-        return (p.x >= sz.width * 0.58f && p.y >= sz.height * 0.40f);
-    } else { // Portrait: jump button is bottom-right
-        return (p.x >= sz.width * 0.50f && p.y >= sz.height * 0.60f);
-    }
-}
--(void)updateJumpState{
-    BOOL held = (_jumpTouches.count > 0);
-    [self.menuController setJumpHeld:held];
-}
--(void)touchesBegan:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event{
-    [super touchesBegan:touches withEvent:event];
-    for(UITouch* t in touches){
-        if([self isJumpTouch:t inView:self.view]){
-            [_jumpTouches addObject:t];
-        }
-    }
-    [self updateJumpState];
-}
--(void)touchesMoved:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event{
-    [super touchesMoved:touches withEvent:event];
-    for(UITouch* t in touches){
-        if([self isJumpTouch:t inView:self.view]){
-            [_jumpTouches addObject:t];
-        }else{
-            [_jumpTouches removeObject:t];
-        }
-    }
-    [self updateJumpState];
-}
--(void)touchesEnded:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event{
-    [super touchesEnded:touches withEvent:event];
-    for(UITouch* t in touches){
-        [_jumpTouches removeObject:t];
-    }
-    [self updateJumpState];
-}
--(void)touchesCancelled:(NSSet<UITouch *> *)touches withEvent:(UIEvent *)event{
-    [super touchesCancelled:touches withEvent:event];
-    for(UITouch* t in touches){
-        [_jumpTouches removeObject:t];
-    }
-    [self updateJumpState];
-}
--(void)reset{
-    [super reset];
-    [_jumpTouches removeAllObjects];
-    [self updateJumpState];
-}
-@end
-
 @interface VTMetalView : MTKView
 @property(nonatomic,weak) id touchOwner;
+@end
+
+@interface VTPassthroughView : UIView
+@property(nonatomic,weak) VTMenuController* menuController;
 @end
 
 // Plain NSObject controller (not a UIViewController) so its overlay view is a
@@ -225,37 +153,120 @@ static bool VTCheckBuild(){
     UITouch* _primaryTouch;
     CGPoint _touchStart,_touchPrevious;
     BOOL _panning;
+    BOOL _draggingWindow;
     CFTimeInterval _lastFrame,_nextBuildCheck,_resumeAfter;
     CGSize _lastLayoutSize;
     BOOL _isScreenCaptured;
+    UITextField* _secureField;
 }
 @property(nonatomic,strong) VTPassthroughView* view;
 @property(nonatomic,strong) VTMetalView* metalView;
 @property(nonatomic,strong) id<MTLDevice> device;
 @property(nonatomic,strong) id<MTLCommandQueue> commandQueue;
 -(instancetype)initWithFrame:(CGRect)frame;
+-(NSURL*)settingsURL;
+-(void)restoreSettings;
+-(void)saveSettings;
+-(void)setupView;
 -(void)beginTouches:(NSSet<UITouch*>*)touches;
 -(void)moveTouches:(NSSet<UITouch*>*)touches;
 -(void)endTouches:(NSSet<UITouch*>*)touches cancelled:(BOOL)cancelled;
+-(void)cancelMouse;
 -(void)setRenderingActive:(BOOL)active;
 -(BOOL)acceptsPoint:(CGPoint)point;
 -(void)tryStartBackend:(CFTimeInterval)now;
 -(void)handleLayoutChange:(CGSize)size;
 -(void)setJumpHeld:(BOOL)held;
 -(void)handleScreenCaptureChanged:(BOOL)captured;
+-(void)updateAntiCaptureState;
 -(void)activateKeyString:(NSString*)rawKey;
 -(void)checkOrActivateKey:(NSString*)key token:(NSString*)token;
+-(void)promptKeyInputAlert;
 @end
 
-@interface VTPassthroughView:UIView
-@property(nonatomic,weak) VTMenuController*menuController;
+@interface VTJumpGestureRecognizer : UIGestureRecognizer <UIGestureRecognizerDelegate>
+@property(nonatomic,weak) VTMenuController* menuController;
 @end
+
+@implementation VTJumpGestureRecognizer {
+    NSMutableSet<UITouch*>* _jumpTouches;
+}
+-(instancetype)init{
+    if(self=[super initWithTarget:nil action:nil]){
+        self.cancelsTouchesInView=NO;
+        self.delaysTouchesBegan=NO;
+        self.delaysTouchesEnded=NO;
+        self.delegate=self;
+        _jumpTouches=[NSMutableSet setWithCapacity:8];
+    }
+    return self;
+}
+-(BOOL)canPreventGestureRecognizer:(UIGestureRecognizer*)preventedGestureRecognizer{return NO;}
+-(BOOL)canBePreventedByGestureRecognizer:(UIGestureRecognizer*)preventingGestureRecognizer{return NO;}
+-(BOOL)gestureRecognizer:(UIGestureRecognizer*)gestureRecognizer shouldRecognizeSimultaneouslyWithGestureRecognizer:(UIGestureRecognizer*)otherGestureRecognizer{return YES;}
+
+-(BOOL)isJumpTouch:(UITouch*)touch inView:(UIView*)view{
+    if(!view)return NO;
+    CGPoint p=[touch locationInView:view];
+    CGSize sz=view.bounds.size;
+    if(sz.width<=0||sz.height<=0)return NO;
+    if(sz.width>=sz.height){ // Landscape: jump button is bottom-right
+        return (p.x>=sz.width*0.58f&&p.y>=sz.height*0.40f);
+    }else{ // Portrait: jump button is bottom-right
+        return (p.x>=sz.width*0.50f&&p.y>=sz.height*0.60f);
+    }
+}
+-(void)updateJumpState{
+    BOOL held=(_jumpTouches.count>0);
+    [self.menuController setJumpHeld:held];
+}
+-(void)touchesBegan:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{
+    [super touchesBegan:touches withEvent:event];
+    for(UITouch*t in touches){
+        if([self isJumpTouch:t inView:self.view]){
+            [_jumpTouches addObject:t];
+        }
+    }
+    [self updateJumpState];
+}
+-(void)touchesMoved:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{
+    [super touchesMoved:touches withEvent:event];
+    for(UITouch*t in touches){
+        if([self isJumpTouch:t inView:self.view]){
+            [_jumpTouches addObject:t];
+        }else{
+            [_jumpTouches removeObject:t];
+        }
+    }
+    [self updateJumpState];
+}
+-(void)touchesEnded:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{
+    [super touchesEnded:touches withEvent:event];
+    for(UITouch*t in touches){
+        [_jumpTouches removeObject:t];
+    }
+    [self updateJumpState];
+}
+-(void)touchesCancelled:(NSSet<UITouch*>*)touches withEvent:(UIEvent*)event{
+    [super touchesCancelled:touches withEvent:event];
+    for(UITouch*t in touches){
+        [_jumpTouches removeObject:t];
+    }
+    [self updateJumpState];
+}
+-(void)reset{
+    [super reset];
+    [_jumpTouches removeAllObjects];
+    [self updateJumpState];
+}
+@end
+
 @implementation VTPassthroughView
 -(UIView*)hitTest:(CGPoint)point withEvent:(UIEvent*)event{
     if(self.hidden||self.alpha<.01||!self.userInteractionEnabled||![self pointInside:point withEvent:event]||!self.menuController.metalView)return nil;
     CGPoint local=[self.menuController.metalView convertPoint:point fromView:self];
     if(![self.menuController acceptsPoint:local])return nil;
-    return [super hitTest:point withEvent:event];
+    return self.menuController.metalView;
 }
 -(void)layoutSubviews{
     [super layoutSubviews];
@@ -272,126 +283,177 @@ static bool VTCheckBuild(){
 
 @implementation VTMenuController
 -(void)setJumpHeld:(BOOL)held{
-    _model.jumpPressed = (held == YES);
+    _model.jumpPressed=(held==YES);
 }
--(void)handleScreenCaptureChanged:(BOOL)captured{
-    _isScreenCaptured = captured;
-    if(_model.antiCapture && captured){
-        self.metalView.hidden = YES;
-    } else {
-        self.metalView.hidden = NO;
+-(void)updateAntiCaptureState{
+    if(_secureField){
+        _secureField.secureTextEntry=_model.antiCapture?YES:NO;
+    }
+    if(_model.antiCapture&&(_isScreenCaptured||UIScreen.mainScreen.isCaptured)){
+        self.metalView.hidden=YES;
+    }else{
+        self.metalView.hidden=NO;
     }
 }
+-(void)handleScreenCaptureChanged:(BOOL)captured{
+    _isScreenCaptured=captured;
+    [self updateAntiCaptureState];
+}
 -(NSString*)sha256Hex:(NSString*)input{
-    const char* str = [input UTF8String];
+    const char*str=[input UTF8String];
+    if(!str)str="";
     unsigned char result[CC_SHA256_DIGEST_LENGTH];
-    CC_SHA256(str, (CC_LONG)strlen(str), result);
-    NSMutableString* hex = [NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH * 2];
-    for(int i = 0; i < CC_SHA256_DIGEST_LENGTH; i++){
-        [hex appendFormat:@"%02x", result[i]];
+    CC_SHA256(str,(CC_LONG)strlen(str),result);
+    NSMutableString*hex=[NSMutableString stringWithCapacity:CC_SHA256_DIGEST_LENGTH*2];
+    for(int i=0;i<CC_SHA256_DIGEST_LENGTH;i++){
+        [hex appendFormat:@"%02x",result[i]];
     }
     return hex;
 }
 -(NSString*)randomHex64{
     unsigned char bytes[32];
-    arc4random_buf(bytes, sizeof(bytes));
-    NSMutableString* hex = [NSMutableString stringWithCapacity:64];
-    for(int i = 0; i < 32; i++) [hex appendFormat:@"%02x", bytes[i]];
+    arc4random_buf(bytes,sizeof(bytes));
+    NSMutableString*hex=[NSMutableString stringWithCapacity:64];
+    for(int i=0;i<32;i++)[hex appendFormat:@"%02x",bytes[i]];
     return hex;
 }
 -(NSString*)deviceIdentifier{
-    NSString* vendor = UIDevice.currentDevice.identifierForVendor.UUIDString;
-    if(!vendor || vendor.length == 0) vendor = @"00000000-0000-0000-0000-000000000000";
-    return [self sha256Hex:[NSString stringWithFormat:@"keydesk-device-v1:%@", vendor.lowercaseString]];
+    NSString*vendor=UIDevice.currentDevice.identifierForVendor.UUIDString;
+    if(!vendor||vendor.length==0)vendor=@"00000000-0000-0000-0000-000000000000";
+    return [self sha256Hex:[NSString stringWithFormat:@"keydesk-device-v1:%@",vendor.lowercaseString]];
+}
+-(void)promptKeyInputAlert{
+    UIWindow*hostWin=self.view.window;
+    UIViewController*topVC=hostWin.rootViewController;
+    while(topVC.presentedViewController)topVC=topVC.presentedViewController;
+    if(!topVC)return;
+    UIAlertController*alert=[UIAlertController alertControllerWithTitle:@"Nhập Key Bản Quyền"
+                                                                message:@"Nhập hoặc dán mã Key từ 45.131.65.244:30019"
+                                                         preferredStyle:UIAlertControllerStyleAlert];
+    __weak VTMenuController*weakSelf=self;
+    [alert addTextFieldWithConfigurationHandler:^(UITextField*textField){
+        VTMenuController*strong=weakSelf;
+        textField.placeholder=@"KCT-XXXX-XXXX-XXXX-XXXX";
+        textField.autocapitalizationType=UITextAutocapitalizationTypeAllCharacters;
+        textField.autocorrectionType=UITextAutocorrectionTypeNo;
+        if(strong&&strong->_model.keyInput[0]!='\0'){
+            textField.text=[NSString stringWithUTF8String:strong->_model.keyInput];
+        }
+    }];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Hủy" style:UIAlertActionStyleCancel handler:nil]];
+    [alert addAction:[UIAlertAction actionWithTitle:@"Kích hoạt" style:UIAlertActionStyleDefault handler:^(UIAlertAction*action){
+        VTMenuController*strong=weakSelf;
+        if(!strong)return;
+        NSString*entered=alert.textFields.firstObject.text;
+        if(entered&&entered.length>0){
+            NSString*clean=[entered stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString;
+            strncpy(strong->_model.keyInput,clean.UTF8String,sizeof(strong->_model.keyInput)-1);
+            strong->_model.keyInput[sizeof(strong->_model.keyInput)-1]='\0';
+            [strong activateKeyString:clean];
+        }
+    }]];
+    [topVC presentViewController:alert animated:YES completion:nil];
 }
 -(void)activateKeyString:(NSString*)rawKey{
-    if(!rawKey || rawKey.length == 0) return;
-    NSString* clean = [rawKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString;
-    _model.license.statusText = "Đang xác thực với máy chủ 45.131.65.244:30019...";
-    NSString* devId = [self deviceIdentifier];
-    NSString* nonce = [self randomHex64];
-    NSDictionary* payload = @{
-        @"key": clean,
-        @"device_id": devId,
-        @"nonce": nonce,
-        @"build_id": @"PTG-iOS-R5.7"
+    NSString*clean=rawKey?[rawKey stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString:@"";
+    if(clean.length==0){
+        NSString*clip=UIPasteboard.generalPasteboard.string;
+        if(clip){
+            clean=[clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString;
+        }
+    }
+    if(clean.length==0){
+        [self promptKeyInputAlert];
+        return;
+    }
+    strncpy(_model.keyInput,clean.UTF8String,sizeof(_model.keyInput)-1);
+    _model.keyInput[sizeof(_model.keyInput)-1]='\0';
+    _model.license.statusText="Đang xác thực với máy chủ 45.131.65.244:30019...";
+    NSString*devId=[self deviceIdentifier];
+    NSString*nonce=[self randomHex64];
+    NSDictionary*payload=@{
+        @"key":clean,
+        @"device_id":devId,
+        @"nonce":nonce,
+        @"build_id":@"PTG-iOS-R5.7"
     };
-    NSURL* url = [NSURL URLWithString:@"http://45.131.65.244:30019/api/v1/activate"];
-    NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:8.0];
-    req.HTTPMethod = @"POST";
+    NSURL*url=[NSURL URLWithString:@"http://45.131.65.244:30019/api/v1/activate"];
+    NSMutableURLRequest*req=[NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:8.0];
+    req.HTTPMethod=@"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-    
-    __weak VTMenuController* weakSelf = self;
-    NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            VTMenuController* strong = weakSelf;
-            if(!strong) return;
+    req.HTTPBody=[NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    __weak VTMenuController*weakSelf=self;
+    NSURLSessionDataTask*task=[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData*data,NSURLResponse*response,NSError*error){
+        dispatch_async(dispatch_get_main_queue(),^{
+            VTMenuController*strong=weakSelf;
+            if(!strong)return;
             if(error){
-                strong->_model.license.statusText = [NSString stringWithFormat:@"Lỗi mạng: %@", error.localizedDescription].UTF8String;
+                strong->_model.license.statusText=[NSString stringWithFormat:@"Lỗi mạng: %@",error.localizedDescription].UTF8String;
                 return;
             }
-            NSHTTPURLResponse* httpResp = (NSHTTPURLResponse*)response;
-            id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            if([json isKindOfClass:NSDictionary.class] && [json[@"ok"] boolValue]){
-                strong->_model.license.valid = true;
-                strong->_model.license.key = clean.UTF8String;
-                strncpy(strong->_model.keyInput, clean.UTF8String, sizeof(strong->_model.keyInput) - 1);
-                if([json[@"token"] isKindOfClass:NSString.class]) strong->_model.license.token = [json[@"token"] UTF8String];
-                if([json[@"expires_at"] isKindOfClass:NSNumber.class]) strong->_model.license.expiresAt = [json[@"expires_at"] longLongValue];
-                if([json[@"remaining_seconds"] isKindOfClass:NSNumber.class]) strong->_model.license.remainingSeconds = [json[@"remaining_seconds"] longLongValue];
-                long long rem = strong->_model.license.remainingSeconds;
-                long days = rem / 86400; long hours = (rem % 86400) / 3600;
-                strong->_model.license.statusText = [NSString stringWithFormat:@"Key Hợp Lệ • Còn %ld ngày %ld giờ", days, hours].UTF8String;
-                strong->_model.toast = "Kích hoạt Key thành công!";
-                strong->_model.toastUntil = strong->_model.time + 2.0;
+            NSHTTPURLResponse*httpResp=(NSHTTPURLResponse*)response;
+            id json=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+            if([json isKindOfClass:NSDictionary.class]&&[json[@"ok"] boolValue]){
+                strong->_model.license.valid=true;
+                strong->_model.license.key=clean.UTF8String;
+                strncpy(strong->_model.keyInput,clean.UTF8String,sizeof(strong->_model.keyInput)-1);
+                strong->_model.keyInput[sizeof(strong->_model.keyInput)-1]='\0';
+                if([json[@"token"] isKindOfClass:NSString.class])strong->_model.license.token=[json[@"token"] UTF8String];
+                if([json[@"expires_at"] isKindOfClass:NSNumber.class])strong->_model.license.expiresAt=[json[@"expires_at"] longLongValue];
+                if([json[@"remaining_seconds"] isKindOfClass:NSNumber.class])strong->_model.license.remainingSeconds=[json[@"remaining_seconds"] longLongValue];
+                long long rem=strong->_model.license.remainingSeconds;
+                long days=(long)(rem/86400);long hours=(long)((rem%86400)/3600);
+                strong->_model.license.statusText=[NSString stringWithFormat:@"Key Hợp Lệ • Còn %ld ngày %ld giờ",days,hours].UTF8String;
+                strong->_model.toast="Kích hoạt Key thành công!";
+                strong->_model.toastUntil=strong->_model.time+2.0;
                 [strong saveSettings];
-            } else {
-                strong->_model.license.valid = false;
-                NSString* errStr = nil;
-                if([json isKindOfClass:NSDictionary.class] && [json[@"error"] isKindOfClass:NSString.class]){
-                    errStr = json[@"error"];
-                } else {
-                    errStr = [NSString stringWithFormat:@"HTTP %ld", (long)httpResp.statusCode];
+            }else{
+                strong->_model.license.valid=false;
+                NSString*errStr=nil;
+                if([json isKindOfClass:NSDictionary.class]&&[json[@"error"] isKindOfClass:NSString.class]){
+                    errStr=json[@"error"];
+                }else{
+                    errStr=[NSString stringWithFormat:@"HTTP %ld",(long)httpResp.statusCode];
                 }
-                strong->_model.license.statusText = [NSString stringWithFormat:@"Kích hoạt thất bại: %@", errStr].UTF8String;
+                strong->_model.license.statusText=[NSString stringWithFormat:@"Kích hoạt thất bại: %@",errStr].UTF8String;
             }
         });
     }];
     [task resume];
 }
 -(void)checkOrActivateKey:(NSString*)key token:(NSString*)token{
-    if(!token || token.length == 0){
+    if(!token||token.length==0){
         [self activateKeyString:key];
         return;
     }
-    NSString* devId = [self deviceIdentifier];
-    NSDictionary* payload = @{
-        @"token": token,
-        @"device_id": devId
+    NSString*devId=[self deviceIdentifier];
+    NSDictionary*payload=@{
+        @"token":token,
+        @"device_id":devId
     };
-    NSURL* url = [NSURL URLWithString:@"http://45.131.65.244:30019/api/v1/check"];
-    NSMutableURLRequest* req = [NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:8.0];
-    req.HTTPMethod = @"POST";
+    NSURL*url=[NSURL URLWithString:@"http://45.131.65.244:30019/api/v1/check"];
+    NSMutableURLRequest*req=[NSMutableURLRequest requestWithURL:url cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:8.0];
+    req.HTTPMethod=@"POST";
     [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
-    req.HTTPBody = [NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
-    
-    __weak VTMenuController* weakSelf = self;
-    NSURLSessionDataTask* task = [[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData* data, NSURLResponse* response, NSError* error) {
-        dispatch_async(dispatch_get_main_queue(), ^{
-            VTMenuController* strong = weakSelf;
-            if(!strong) return;
-            if(error) return; // Retain offline state
-            id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
-            if([json isKindOfClass:NSDictionary.class] && [json[@"ok"] boolValue]){
-                strong->_model.license.valid = true;
-                if([json[@"expires_at"] isKindOfClass:NSNumber.class]) strong->_model.license.expiresAt = [json[@"expires_at"] longLongValue];
-                if([json[@"remaining_seconds"] isKindOfClass:NSNumber.class]) strong->_model.license.remainingSeconds = [json[@"remaining_seconds"] longLongValue];
-                long long rem = strong->_model.license.remainingSeconds;
-                long days = rem / 86400; long hours = (rem % 86400) / 3600;
-                strong->_model.license.statusText = [NSString stringWithFormat:@"Key Hợp Lệ • Còn %ld ngày %ld giờ", days, hours].UTF8String;
+    req.HTTPBody=[NSJSONSerialization dataWithJSONObject:payload options:0 error:nil];
+
+    __weak VTMenuController*weakSelf=self;
+    NSURLSessionDataTask*task=[[NSURLSession sharedSession] dataTaskWithRequest:req completionHandler:^(NSData*data,NSURLResponse*response,NSError*error){
+        dispatch_async(dispatch_get_main_queue(),^{
+            VTMenuController*strong=weakSelf;
+            if(!strong)return;
+            if(error)return; // Retain offline state
+            id json=data?[NSJSONSerialization JSONObjectWithData:data options:0 error:nil]:nil;
+            if([json isKindOfClass:NSDictionary.class]&&[json[@"ok"] boolValue]){
+                strong->_model.license.valid=true;
+                if([json[@"expires_at"] isKindOfClass:NSNumber.class])strong->_model.license.expiresAt=[json[@"expires_at"] longLongValue];
+                if([json[@"remaining_seconds"] isKindOfClass:NSNumber.class])strong->_model.license.remainingSeconds=[json[@"remaining_seconds"] longLongValue];
+                long long rem=strong->_model.license.remainingSeconds;
+                long days=(long)(rem/86400);long hours=(long)((rem%86400)/3600);
+                strong->_model.license.statusText=[NSString stringWithFormat:@"Key Hợp Lệ • Còn %ld ngày %ld giờ",days,hours].UTF8String;
                 [strong saveSettings];
-            } else {
+            }else{
                 [strong activateKeyString:key];
             }
         });
@@ -426,26 +488,27 @@ static bool VTCheckBuild(){
     if([saved[@"jump_interval_ms"] isKindOfClass:NSNumber.class])_model.jumpIntervalMs=[saved[@"jump_interval_ms"] doubleValue];
     if([saved[@"anti_capture"] isKindOfClass:NSNumber.class])_model.antiCapture=[saved[@"anti_capture"] boolValue];
     if([saved[@"floating_btn_x"] isKindOfClass:NSNumber.class]&&[saved[@"floating_btn_y"] isKindOfClass:NSNumber.class]){
-        _model.floatingButtonPos={ [saved[@"floating_btn_x"] floatValue], [saved[@"floating_btn_y"] floatValue] };
+        _model.floatingButtonPos={[saved[@"floating_btn_x"] floatValue],[saved[@"floating_btn_y"] floatValue]};
     }
     if([saved[@"menu_win_x"] isKindOfClass:NSNumber.class]&&[saved[@"menu_win_y"] isKindOfClass:NSNumber.class]){
-        _model.menuWindowPos={ [saved[@"menu_win_x"] floatValue], [saved[@"menu_win_y"] floatValue] };
+        _model.menuWindowPos={[saved[@"menu_win_x"] floatValue],[saved[@"menu_win_y"] floatValue]};
     }
     if([saved[@"license_valid"] isKindOfClass:NSNumber.class])_model.license.valid=[saved[@"license_valid"] boolValue];
     if([saved[@"license_key"] isKindOfClass:NSString.class]){
         _model.license.key=[saved[@"license_key"] UTF8String];
-        strncpy(_model.keyInput, _model.license.key.c_str(), sizeof(_model.keyInput)-1);
+        strncpy(_model.keyInput,_model.license.key.c_str(),sizeof(_model.keyInput)-1);
+        _model.keyInput[sizeof(_model.keyInput)-1]='\0';
     }
     if([saved[@"license_token"] isKindOfClass:NSString.class])_model.license.token=[saved[@"license_token"] UTF8String];
     if([saved[@"license_expires"] isKindOfClass:NSNumber.class])_model.license.expiresAt=[saved[@"license_expires"] longLongValue];
     if([saved[@"license_remaining"] isKindOfClass:NSNumber.class])_model.license.remainingSeconds=[saved[@"license_remaining"] longLongValue];
     if([saved[@"license_status"] isKindOfClass:NSString.class])_model.license.statusText=[saved[@"license_status"] UTF8String];
-    
+
     vt::ios::sanitize(_model);_model.enabled.fill(false);_model.visible=false;_model.jumpPressed=false;
     if(!_model.license.key.empty()){
-        NSString* savedKey=[NSString stringWithUTF8String:_model.license.key.c_str()];
-        NSString* savedToken=[NSString stringWithUTF8String:_model.license.token.c_str()];
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NSString*savedKey=[NSString stringWithUTF8String:_model.license.key.c_str()];
+        NSString*savedToken=[NSString stringWithUTF8String:_model.license.token.c_str()];
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,(int64_t)(1.0*NSEC_PER_SEC)),dispatch_get_main_queue(),^{
             [self checkOrActivateKey:savedKey token:savedToken];
         });
     }
@@ -483,9 +546,35 @@ static bool VTCheckBuild(){
     self.metalView=[[VTMetalView alloc]initWithFrame:self.view.bounds device:self.device];self.metalView.delegate=self;self.metalView.touchOwner=self;
     self.metalView.multipleTouchEnabled=YES;self.metalView.preferredFramesPerSecond=60;
     self.metalView.colorPixelFormat=MTLPixelFormatBGRA8Unorm;self.metalView.opaque=NO;self.metalView.layer.opaque=NO;self.metalView.backgroundColor=UIColor.clearColor;self.metalView.clearColor=MTLClearColorMake(0,0,0,0);
-    self.metalView.translatesAutoresizingMaskIntoConstraints=NO;[self.view addSubview:self.metalView];
+    self.metalView.translatesAutoresizingMaskIntoConstraints=NO;
+
+    // Secure text field canvas container hides menu & ESP from screenshots and screen recordings
+    _secureField=[[UITextField alloc]initWithFrame:self.view.bounds];
+    _secureField.secureTextEntry=_model.antiCapture?YES:NO;
+    _secureField.userInteractionEnabled=NO;
+    _secureField.backgroundColor=UIColor.clearColor;
+    _secureField.opaque=NO;
+    _secureField.translatesAutoresizingMaskIntoConstraints=NO;
+    [self.view addSubview:_secureField];
+    UIView*secureCanvas=_secureField.subviews.firstObject;
+    UIView*metalHost=secureCanvas?secureCanvas:self.view;
+    metalHost.backgroundColor=UIColor.clearColor;
+    metalHost.opaque=NO;
+    [metalHost addSubview:self.metalView];
+
     UIView*g=self.view;
-    [NSLayoutConstraint activateConstraints:@[[self.metalView.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],[self.metalView.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],[self.metalView.topAnchor constraintEqualToAnchor:g.topAnchor],[self.metalView.bottomAnchor constraintEqualToAnchor:g.bottomAnchor]]];
+    [NSLayoutConstraint activateConstraints:@[
+        [_secureField.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+        [_secureField.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+        [_secureField.topAnchor constraintEqualToAnchor:g.topAnchor],
+        [_secureField.bottomAnchor constraintEqualToAnchor:g.bottomAnchor],
+        [self.metalView.leadingAnchor constraintEqualToAnchor:g.leadingAnchor],
+        [self.metalView.trailingAnchor constraintEqualToAnchor:g.trailingAnchor],
+        [self.metalView.topAnchor constraintEqualToAnchor:g.topAnchor],
+        [self.metalView.bottomAnchor constraintEqualToAnchor:g.bottomAnchor]
+    ]];
+    [self updateAntiCaptureState];
+
     IMGUI_CHECKVERSION();_context=ImGui::CreateContext();ImGuiIO&io=ImGui::GetIO();io.IniFilename=nullptr;io.LogFilename=nullptr;io.ConfigFlags|=ImGuiConfigFlags_NoMouseCursorChange;
     CGFloat scale=UIScreen.mainScreen.scale;ImFontConfig cfg;cfg.OversampleH=2;cfg.OversampleV=1;cfg.FontDataOwnedByAtlas=false;
     io.Fonts->AddFontFromMemoryTTF(const_cast<unsigned char*>(vt::ios::FontBytes),int(sizeof(vt::ios::FontBytes)),16.f*scale,&cfg,io.Fonts->GetGlyphRangesVietnamese());
@@ -503,17 +592,25 @@ static bool VTCheckBuild(){
     _actions.stop=[weakSelf]{VTMenuController*strong=weakSelf;if(strong&&strong->_backend)strong->_backend->stop(strong->_model);};
     _actions.number=[weakSelf](int,double){VTMenuController*strong=weakSelf;if(strong)[strong saveSettings];};
     _actions.toggle=[weakSelf](int id){VTMenuController*strong=weakSelf;if(strong&&strong->_backend)strong->_backend->toggle(strong->_model,id);};
-    _actions.activateKey=[weakSelf](const std::string& k){
+    _actions.activateKey=[weakSelf](const std::string&k){
         VTMenuController*strong=weakSelf;if(strong)[strong activateKeyString:[NSString stringWithUTF8String:k.c_str()]];
     };
     _actions.pasteKey=[weakSelf]{
         VTMenuController*strong=weakSelf;if(strong){
             NSString*clip=UIPasteboard.generalPasteboard.string;
-            if(clip){
+            if(clip&&clip.length>0){
                 NSString*clean=[clip stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]].uppercaseString;
-                strncpy(strong->_model.keyInput, clean.UTF8String, sizeof(strong->_model.keyInput)-1);
+                strncpy(strong->_model.keyInput,clean.UTF8String,sizeof(strong->_model.keyInput)-1);
+                strong->_model.keyInput[sizeof(strong->_model.keyInput)-1]='\0';
+                strong->_model.toast="Đã dán Key từ bộ nhớ tạm";
+                strong->_model.toastUntil=strong->_model.time+1.5;
+            }else{
+                [strong promptKeyInputAlert];
             }
         }
+    };
+    _actions.promptKeyInput=[weakSelf]{
+        VTMenuController*strong=weakSelf;if(strong)[strong promptKeyInputAlert];
     };
     _actions.clearKey=[weakSelf]{
         VTMenuController*strong=weakSelf;if(strong){
@@ -521,13 +618,14 @@ static bool VTCheckBuild(){
             strong->_model.license.key.clear();
             strong->_model.license.token.clear();
             strong->_model.license.statusText="Đã đổi key; vui lòng nhập key mới";
-            strong->_model.keyInput[0]="\0";
+            strong->_model.keyInput[0]='\0';
             [strong saveSettings];
         }
     };
     _actions.toggleAntiCapture=[weakSelf](bool enabled){
         VTMenuController*strong=weakSelf;if(strong){
             strong->_model.antiCapture=enabled;
+            [strong updateAntiCaptureState];
             [strong saveSettings];
         }
     };
@@ -564,7 +662,7 @@ static bool VTCheckBuild(){
 -(void)handleLayoutChange:(CGSize)size{
     if(size.width<=0||size.height<=0)return;
     if(!CGSizeEqualToSize(size,_lastLayoutSize)){
-        [self cancelMouse];_primaryTouch=nil;_panning=NO;_model.scrollDelta=0;_model.suppressActions=true;
+        [self cancelMouse];_primaryTouch=nil;_panning=NO;_draggingWindow=NO;_model.scrollDelta=0;_model.suppressActions=true;
         _model.windowMin=_model.windowMax={};_lastLayoutSize=size;
         if(_backend)_backend->suspend(CACurrentMediaTime());
     }
@@ -574,12 +672,48 @@ static bool VTCheckBuild(){
 }
 -(void)beginTouches:(NSSet<UITouch*>*)touches{
     if(!_context||_primaryTouch)return;_primaryTouch=touches.anyObject;
-    _touchStart=_touchPrevious=[_primaryTouch locationInView:self.metalView];_panning=NO;_model.suppressActions=false;
+    _touchStart=_touchPrevious=[_primaryTouch locationInView:self.metalView];
+    _panning=NO;_draggingWindow=NO;_model.suppressActions=false;
     ImGui::SetCurrentContext(_context);auto&io=ImGui::GetIO();io.AddMouseSourceEvent(ImGuiMouseSource_TouchScreen);io.AddMousePosEvent(_touchStart.x,_touchStart.y);io.AddMouseButtonEvent(0,true);
 }
 -(void)moveTouches:(NSSet<UITouch*>*)touches{
     if(!_context||!_primaryTouch||![touches containsObject:_primaryTouch])return;
-    CGPoint p=[_primaryTouch locationInView:self.metalView];CGFloat dx=p.x-_touchStart.x,dy=p.y-_touchStart.y;
+    CGPoint p=[_primaryTouch locationInView:self.metalView];
+    CGFloat dx=p.x-_touchStart.x,dy=p.y-_touchStart.y;
+    const CGFloat dist=hypot(dx,dy);
+
+    // 1. Dragging the collapsed floating "Menu" button
+    if(!_model.visible){
+        if(!_draggingWindow&&dist>8.0){
+            _draggingWindow=YES;
+            _model.suppressActions=true;
+            [self cancelMouse];
+        }
+        if(_draggingWindow){
+            _model.floatingButtonPos.x+=float(p.x-_touchPrevious.x);
+            _model.floatingButtonPos.y+=float(p.y-_touchPrevious.y);
+            _touchPrevious=p;
+            return;
+        }
+    }
+
+    // 2. Dragging the open Menu window via its header bar
+    const BOOL inHeader=_model.visible&&_touchStart.y>=_model.windowMin.y&&_touchStart.y<_model.contentMin.y&&_touchStart.x<_model.windowMax.x-68.f;
+    if(_model.visible&&inHeader){
+        if(!_draggingWindow&&dist>6.0){
+            _draggingWindow=YES;
+            _model.suppressActions=true;
+            [self cancelMouse];
+        }
+        if(_draggingWindow){
+            _model.menuWindowPos.x+=float(p.x-_touchPrevious.x);
+            _model.menuWindowPos.y+=float(p.y-_touchPrevious.y);
+            _touchPrevious=p;
+            return;
+        }
+    }
+
+    // 3. Scrolling inside content area or interacting with controls
     const BOOL inContent=_touchStart.x>=_model.contentMin.x&&_touchStart.x<_model.contentMax.x&&_touchStart.y>=_model.contentMin.y&&_touchStart.y<_model.contentMax.y;
     if(!_panning&&_model.visible&&inContent&&!_model.sliderActive&&fabs(dy)>14&&fabs(dy)>fabs(dx)*1.5){_panning=YES;_model.suppressActions=true;[self cancelMouse];}
     if(_panning){_model.scrollDelta+=p.y-_touchPrevious.y;}
@@ -589,13 +723,19 @@ static bool VTCheckBuild(){
 -(void)endTouches:(NSSet<UITouch*>*)touches cancelled:(BOOL)cancelled{
     if(!_context||!_primaryTouch||![touches containsObject:_primaryTouch])return;
     ImGui::SetCurrentContext(_context);
-    if(cancelled||_panning){_model.suppressActions=true;[self cancelMouse];}
-    else{CGPoint p=[_primaryTouch locationInView:self.metalView];auto&io=ImGui::GetIO();io.AddMousePosEvent(p.x,p.y);io.AddMouseButtonEvent(0,false);}
-    _primaryTouch=nil;_panning=NO;
+    if(cancelled||_panning||_draggingWindow){
+        _model.suppressActions=true;
+        [self cancelMouse];
+        if(_draggingWindow)[self saveSettings];
+    }else{
+        CGPoint p=[_primaryTouch locationInView:self.metalView];
+        auto&io=ImGui::GetIO();io.AddMousePosEvent(p.x,p.y);io.AddMouseButtonEvent(0,false);
+    }
+    _primaryTouch=nil;_panning=NO;_draggingWindow=NO;
 }
 -(void)setRenderingActive:(BOOL)active{
-    [self cancelMouse];_primaryTouch=nil;_panning=NO;_model.scrollDelta=0;_model.suppressActions=true;
-    if(!active){if(_backend)_backend->stop(_model);_model.visible=false;_model.enabled.fill(false);[self saveSettings];_resumeAfter=0;}
+    [self cancelMouse];_primaryTouch=nil;_panning=NO;_draggingWindow=NO;_model.scrollDelta=0;_model.suppressActions=true;
+    if(!active){if(_backend)_backend->stop(_model);_model.visible=false;_model.enabled.fill(false);_model.jumpPressed=false;[self saveSettings];_resumeAfter=0;}
     else{
         _resumeAfter=CACurrentMediaTime()+1.;
         if(_backend)_backend->suspend(CACurrentMediaTime());
@@ -613,7 +753,7 @@ static bool VTCheckBuild(){
     CFTimeInterval now=CACurrentMediaTime();io.DeltaTime=_lastFrame?float(fmin(.1,fmax(.001,now-_lastFrame))):1.f/60;_lastFrame=now;
     const CGSize bounds=view.bounds.size;
     if(!CGSizeEqualToSize(bounds,_lastLayoutSize)){
-        [self cancelMouse];_primaryTouch=nil;_panning=NO;_model.scrollDelta=0;_model.suppressActions=true;
+        [self cancelMouse];_primaryTouch=nil;_panning=NO;_draggingWindow=NO;_model.scrollDelta=0;_model.suppressActions=true;
         _model.windowMin=_model.windowMax={};_lastLayoutSize=bounds;
         if(_backend)_backend->suspend(now);
     }
@@ -628,7 +768,7 @@ static bool VTCheckBuild(){
     if(now>=_resumeAfter&&_backend)_backend->tick(_model,now);
     bool busy=_model.visible||vt::ios::runtimeRequested(_model);view.preferredFramesPerSecond=busy?60:15;
     ImGui_ImplMetal_NewFrame(pass);ImGui::NewFrame();
-    if(_backend&&(_model.enabled[vt::Line]||_model.enabled[vt::Esp])){
+    if(_backend&&_model.license.valid&&(_model.enabled[vt::Line]||_model.enabled[vt::Esp])){
         auto*d=ImGui::GetBackgroundDrawList();
         const float w=io.DisplaySize.x,h=io.DisplaySize.y;
         const ImU32 darkOutline=IM_COL32(0,0,0,185);
@@ -726,8 +866,44 @@ static UIView* VTFindGameView(UIView*view,int depth){
     return nil;
 }
 
+static void VTAttachJumpRecognizers(UIView*unity,UIView*container){
+    if(!VTController)return;
+    UIView*touchTarget=unity?unity:container;
+    if(touchTarget){
+        BOOL hasJumpRec=NO;
+        for(UIGestureRecognizer*gr in touchTarget.gestureRecognizers){
+            if([gr isKindOfClass:VTJumpGestureRecognizer.class]){
+                ((VTJumpGestureRecognizer*)gr).menuController=VTController;
+                hasJumpRec=YES;
+                break;
+            }
+        }
+        if(!hasJumpRec){
+            VTJumpGestureRecognizer*jg=[[VTJumpGestureRecognizer alloc]init];
+            jg.menuController=VTController;
+            [touchTarget addGestureRecognizer:jg];
+        }
+    }
+    if(container&&container!=touchTarget){
+        BOOL hasOnContainer=NO;
+        for(UIGestureRecognizer*gr in container.gestureRecognizers){
+            if([gr isKindOfClass:VTJumpGestureRecognizer.class]){
+                ((VTJumpGestureRecognizer*)gr).menuController=VTController;
+                hasOnContainer=YES;
+                break;
+            }
+        }
+        if(!hasOnContainer){
+            VTJumpGestureRecognizer*jg=[[VTJumpGestureRecognizer alloc]init];
+            jg.menuController=VTController;
+            [container addGestureRecognizer:jg];
+        }
+    }
+}
+
 static void VTDetach(){
     if(!VTController)return;
+    [VTController setJumpHeld:NO];
     [VTController setRenderingActive:NO];
     [VTController.view removeFromSuperview];
     VTController=nil;VTHostView=nil;VTHostScene=nil;VTHostWindow=nil;
@@ -762,40 +938,10 @@ static void VTAttach(){
         if(!CGRectEqualToRect(VTController.view.frame,container.bounds))VTController.view.frame=container.bounds;
         if(!CGRectEqualToRect(VTController.metalView.frame,VTController.view.bounds))VTController.metalView.frame=VTController.view.bounds;
         if(container.subviews.lastObject!=VTController.view)[container bringSubviewToFront:VTController.view];
-    UIView* touchTarget = unity ? unity : container;
-    if (touchTarget) {
-        BOOL hasJumpRec = NO;
-        for (UIGestureRecognizer* gr in touchTarget.gestureRecognizers) {
-            if ([gr isKindOfClass:VTJumpGestureRecognizer.class]) {
-                ((VTJumpGestureRecognizer*)gr).menuController = VTController;
-                hasJumpRec = YES;
-                break;
-            }
-        }
-        if (!hasJumpRec) {
-            VTJumpGestureRecognizer* jg = [[VTJumpGestureRecognizer alloc] init];
-            jg.menuController = VTController;
-            [touchTarget addGestureRecognizer:jg];
-        }
-    }
-    if (container && container != touchTarget) {
-        BOOL hasOnContainer = NO;
-        for (UIGestureRecognizer* gr in container.gestureRecognizers) {
-            if ([gr isKindOfClass:VTJumpGestureRecognizer.class]) {
-                ((VTJumpGestureRecognizer*)gr).menuController = VTController;
-                hasOnContainer = YES;
-                break;
-            }
-        }
-        if (!hasOnContainer) {
-            VTJumpGestureRecognizer* jg = [[VTJumpGestureRecognizer alloc] init];
-            jg.menuController = VTController;
-            [container addGestureRecognizer:jg];
-        }
-    }
+        VTAttachJumpRecognizers(unity,container);
         if(VTController.view.hidden||VTController.metalView.paused){
             VTController.view.hidden=NO;
-            VTController.metalView.hidden=NO;
+            [VTController updateAntiCaptureState];
             [VTController setRenderingActive:YES];
         }
         return;
@@ -805,6 +951,7 @@ static void VTAttach(){
     VTHostView=container;VTHostScene=game.windowScene;VTHostWindow=game;
     [container addSubview:VTController.view];
     [container bringSubviewToFront:VTController.view];
+    VTAttachJumpRecognizers(unity,container);
 }
 
 extern "C" __attribute__((visibility("default"))) void VTMenuStart(){dispatch_async(dispatch_get_main_queue(),^{VTAttach();});}
